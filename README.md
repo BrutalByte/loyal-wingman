@@ -43,6 +43,18 @@ task. Lessons taught before an embedding model was available (or before
 this feature existed) get embedded lazily on the next `run` that has one
 loaded.
 
+## Tests
+
+Unit tests cover the lessons storage/retrieval logic (`tests/test_retrieval.py`)
+with no network or LM Studio server required -- `_embed` is mocked. Uses
+only the standard library (`unittest.mock`), so no test dependency to install:
+
+```bash
+python -m unittest discover -s tests
+```
+
+Also runs under pytest if you have it installed (`pytest tests/`).
+
 ## Install
 
 ```bash
