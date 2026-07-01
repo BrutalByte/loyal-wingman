@@ -1,6 +1,7 @@
 # Loyal Wingman
 
 [![Tests](https://github.com/BrutalByte/loyal-wingman/actions/workflows/tests.yml/badge.svg)](https://github.com/BrutalByte/loyal-wingman/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/loyal-wingman.svg)](https://pypi.org/project/loyal-wingman/)
 
 Offload menial coding-agent tasks to a local LLM (via [LM Studio](https://lmstudio.ai)),
 and teach it not to repeat mistakes.
@@ -56,6 +57,37 @@ python -m unittest discover -s tests
 ```
 
 Also runs under pytest if you have it installed (`pytest tests/`).
+
+## Releasing
+
+`.github/workflows/publish.yml` builds and publishes to PyPI whenever a
+GitHub Release is published (not on every push -- publishing is not
+reversible, so it requires that explicit, visible step). It uses
+[PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC),
+so no API token is stored as a secret.
+
+**One-time setup, before the first release:**
+
+1. On [pypi.org](https://pypi.org), under your account's Publishing settings,
+   add a trusted publisher for a new project named `loyal-wingman`:
+   - Owner: `BrutalByte`, Repository: `loyal-wingman`
+   - Workflow: `publish.yml`, Environment: `pypi`
+2. In this repo's GitHub Settings -> Environments, create an environment
+   named `pypi` (optionally add required reviewers here for extra
+   protection against an accidental publish).
+
+**To cut a release:**
+
+1. Bump `version` in `pyproject.toml`.
+2. Commit, push.
+3. Create a GitHub Release with tag `v<version>` (e.g. `v0.2.0`) matching
+   step 1 exactly -- the workflow verifies the tag matches
+   `pyproject.toml`'s version and fails before building/publishing if they
+   don't agree.
+
+Publishing a version number to PyPI can never be undone, even if the
+release is deleted afterward -- double check the version bump before
+creating the release.
 
 ## Install
 

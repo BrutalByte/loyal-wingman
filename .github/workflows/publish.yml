@@ -1,0 +1,62 @@
+name: Publish to PyPI
+
+# Deliberately release-triggered only (no workflow_dispatch/tag-push
+# trigger). Publishing to PyPI is not reversible -- a version number can
+# never be re-uploaded even after deletion -- so a publish should only ever
+# follow the explicit, visible act of creating a GitHub Release.
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Verify release tag matches package version
+        run: |
+          python -c "
+          import re, sys, os
+          tag = os.environ['GITHUB_REF_NAME'].lstrip('v')
+          content = open('pyproject.toml', encoding='utf-8').read()
+          pkg_version = re.search(r'^version = \"([^\"]+)\"', content, re.MULTILINE).group(1)
+          if tag != pkg_version:
+              sys.exit(f'Release tag {tag!r} does not match pyproject.toml version {pkg_version!r} -- bump one of them.')
+          print(f'OK: tag {tag!r} matches package version {pkg_version!r}.')
+          "
+
+      - name: Run tests
+        run: |
+          pip install -e .
+          python -m unittest discover -s tests -v
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/loyal-wingman
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC) -- no stored API token
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
