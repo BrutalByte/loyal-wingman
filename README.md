@@ -17,13 +17,31 @@ spending metered tokens on it.
    already up.
 2. You (or the calling agent) **check the result**.
 3. If it's wrong, **`teach`** the correction. It's appended to a lessons
-   file and automatically prepended to future prompts as in-context
-   guidance -- so the same mistake gets caught before it repeats.
+   file. When you `run` a future task, the most semantically similar past
+   lessons are automatically retrieved and prepended as in-context guidance
+   -- so a relevant correction surfaces even if you don't remember the exact
+   category you taught it under.
 
 This is *not* fine-tuning. Most locally-served models are static weights
 with no online-learning API. Teaching here means in-context correction, not
 a weight update -- cheap, immediate, and good enough for catching repeated
 mistakes without a training pipeline.
+
+## Semantic lesson retrieval
+
+Each lesson's `issue` text is embedded (via a local embedding model, e.g.
+`nomic-embed-text`) when taught. Each `run`'s prompt is embedded the same
+way, and lessons above a similarity floor are retrieved, ranked by
+closeness, and prepended to the system prompt -- regardless of category tag.
+`--category` still works as an optional pre-filter if you want to guarantee
+only a specific bucket of lessons is considered.
+
+If no embedding model is downloaded, or the embedding call fails for any
+reason, this degrades gracefully to "most recent N lessons in category" --
+semantic retrieval is an enhancement, never a hard requirement to run a
+task. Lessons taught before an embedding model was available (or before
+this feature existed) get embedded lazily on the next `run` that has one
+loaded.
 
 ## Install
 
@@ -47,15 +65,21 @@ loyal-wingman run --file big_log_excerpt.txt \
 # Piped input
 some_command | loyal-wingman run --system "Reformat as a bullet list."
 
-# Tag a task by category so relevant lessons get applied
+# Optional: restrict lesson matching to a category before ranking by similarity
 loyal-wingman run "..." --category changelog
+
+# Tune retrieval (defaults: top 5 lessons, similarity floor 0.58)
+loyal-wingman run "..." --top-lessons 3 --min-similarity 0.65
+
+# Skip lesson retrieval entirely (faster; no embedding model needed)
+loyal-wingman run "..." --no-lessons
 
 # After reviewing output and finding a mistake, record the correction
 loyal-wingman teach --category changelog \
   --issue "Wrote a plain sentence instead of the house style" \
   --fix "Format as: **Title** (\`file.py\`): terse technical description"
 
-# Review what's been taught so far
+# Review what's been taught so far (shows embedding status per lesson)
 loyal-wingman lessons
 loyal-wingman lessons --category changelog
 ```
@@ -76,12 +100,34 @@ into an unrelated one.
 4. The sole downloaded model, if exactly one is available
 
 If none of these resolve unambiguously, it errors with the list of
-downloaded models rather than guessing.
+downloaded models rather than guessing. Embedding model selection follows
+the same order via `--embed-model` / `LOYAL_WINGMAN_EMBED_MODEL`, except
+that an ambiguous or missing embedding model degrades to non-semantic
+lesson retrieval instead of erroring.
 
 ## Configuration
 
 - `LOYAL_WINGMAN_MODEL` -- default model id when nothing else applies
+- `LOYAL_WINGMAN_EMBED_MODEL` -- default embedding model id for lesson retrieval
 - `LOYAL_WINGMAN_HOME` -- where the lessons file lives (default: `~/.loyal-wingman/`)
+
+## Known limitation: GPU offload when using two models
+
+`run` loads the embedding model before the main model so that, on a cold
+start, the main model's automatic GPU offload accounts for both models'
+footprint. This does **not** protect against a main model that was already
+loaded (by something else, or by a previous `loyal-wingman run`) before the
+embedding model loads for the first time: LM Studio can rebalance VRAM
+allocation when a second model loads, silently evicting part of an
+already-resident model to CPU. Observed effect: a fully GPU-offloaded 21GB
+model dropped from ~1.5s to 90+s per response. If generation suddenly gets
+much slower after lessons start getting used, reload the main model
+explicitly:
+
+```bash
+lms unload --all
+lms load <model> --gpu max
+```
 
 ## Design notes
 

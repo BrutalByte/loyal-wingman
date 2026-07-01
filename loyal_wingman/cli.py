@@ -12,6 +12,14 @@ prepending matching lessons to future prompts as in-context guidance --
 cheap, immediate, and good enough for catching repeated mistakes without a
 training pipeline.
 
+Lessons are retrieved by semantic similarity, not exact category match: each
+lesson's "issue" text is embedded (via a local embedding model, e.g.
+nomic-embed-text) when taught, the current prompt is embedded when running a
+task, and the most similar past lessons (above a similarity floor) are
+prepended -- so a relevant correction surfaces even if you don't remember
+the exact category tag you used when teaching it. If no embedding model is
+available, this degrades gracefully to "most recent N lessons in category".
+
 `run` auto-starts LM Studio's server and auto-loads a model if neither is
 already up -- no manual `lms server start` / `lms load` step required.
 
@@ -32,6 +40,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -51,8 +60,18 @@ if hasattr(sys.stdout, "reconfigure"):
 LESSONS_PATH = Path(
     os.environ.get("LOYAL_WINGMAN_HOME", Path.home() / ".loyal-wingman")
 ) / "lessons.jsonl"
-MAX_LESSONS_IN_PROMPT = 20
 DEFAULT_TTL_SECONDS = 1800
+DEFAULT_TOP_LESSONS = 5
+# Empirically calibrated against nomic-embed-text-v1.5 on a handful of real
+# vs. unrelated task prompts: genuinely related short technical phrases
+# scored ~0.62-0.64 cosine similarity, unrelated ones ~0.50-0.56. This is a
+# starting point, not a proven constant -- tune with --min-similarity as
+# your own lesson corpus grows and you observe false positives/negatives.
+DEFAULT_MIN_SIMILARITY = 0.58
+# Embedding text is truncated to this many characters before sending, so a
+# large --file input doesn't blow past the embedding model's (typically
+# much smaller than the chat model's) context window.
+MAX_EMBED_CHARS = 2000
 LMS_FALLBACK_PATHS = [
     Path.home() / ".lmstudio" / "bin" / "lms",
     Path.home() / ".lmstudio" / "bin" / "lms.exe",
@@ -109,21 +128,30 @@ def _loaded_models() -> list:
         return []
 
 
-def _available_llms() -> list:
-    """Locally downloaded LLMs (excludes embedding models)."""
+def _available_models(model_type: str) -> list:
+    """Locally downloaded models of the given lms type ("llm" or "embedding")."""
     try:
         result = subprocess.run(
             [_lms_bin(), "ls", "--json"],
             capture_output=True, text=True, timeout=15,
         )
         data = json.loads(result.stdout or "[]")
-        return [m["modelKey"] for m in data if m.get("type") == "llm"]
+        return [m for m in data if m.get("type") == model_type]
     except Exception:
         return []
 
 
+def _available_llms() -> list:
+    """Locally downloaded LLM model ids (excludes embedding models)."""
+    return [m["modelKey"] for m in _available_models("llm")]
+
+
 def _ensure_model(model: str, ttl: int, load_timeout: float = 180.0) -> str:
-    loaded_ids = [m.get("identifier") for m in _loaded_models()]
+    # Must filter to type == "llm" -- _loaded_models() also returns any
+    # loaded embedding model, and an unfiltered list here previously caused
+    # a loaded embedding model to be mistaken for "the loaded LLM" and sent
+    # a chat completion request (which LM Studio correctly rejected).
+    loaded_ids = [m.get("identifier") for m in _loaded_models() if m.get("type") == "llm"]
     if model:
         if model in loaded_ids:
             return model
@@ -165,9 +193,67 @@ def _ensure_model(model: str, ttl: int, load_timeout: float = 180.0) -> str:
     return target
 
 
+def _ensure_embedding_model(model: str, ttl: int, load_timeout: float = 60.0) -> str:
+    """
+    Best-effort: returns an embedding model id ready to use, or "" if none
+    is available/loadable. Semantic lesson retrieval is an enhancement, not
+    a hard requirement, so callers should degrade gracefully on "" rather
+    than treat it as a fatal error the way _ensure_model's failures are.
+    """
+    for m in _loaded_models():
+        if m.get("type") == "embedding":
+            if not model or model == m.get("identifier"):
+                return m.get("identifier")
+
+    target = model or os.environ.get("LOYAL_WINGMAN_EMBED_MODEL", "")
+    available = _available_models("embedding")
+    if not target:
+        if len(available) == 1:
+            target = available[0]["modelKey"]
+        else:
+            return ""  # none or ambiguous -- caller falls back to recency-based selection
+
+    # lms load matches fuzzily against the download path, not the modelKey
+    # used by the API -- an id like "text-embedding-nomic-embed-text-v1.5"
+    # can fail to resolve and drop into an interactive picker. Use the
+    # known path + --exact instead, which resolves deterministically.
+    entry = next((m for m in available if m["modelKey"] == target), None)
+    load_target = entry["path"] if entry else target
+    try:
+        proc = subprocess.run(
+            [_lms_bin(), "load", load_target, "--exact", "--ttl", str(ttl)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=load_timeout,
+        )
+    except Exception:
+        return ""
+    return target if proc.returncode == 0 else ""
+
+
+def _embed(base_url: str, model: str, text: str, timeout: float = 30.0):
+    """Returns an embedding vector (list[float]), or None on any failure."""
+    payload = json.dumps({"model": model, "input": text[:MAX_EMBED_CHARS]}).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/embeddings", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def _cosine(a: list, b: list) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
 # ── Lessons store ─────────────────────────────────────────────────────────
 
-def _load_lessons(category: str = None) -> list:
+def _load_lessons() -> list:
     if not LESSONS_PATH.exists():
         return []
     lessons = []
@@ -180,13 +266,64 @@ def _load_lessons(category: str = None) -> list:
                 lessons.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    if category:
-        lessons = [l for l in lessons if l.get("category") in (category, "general")]
     return lessons
 
 
-def _lessons_block(category: str = None) -> str:
-    lessons = _load_lessons(category)[-MAX_LESSONS_IN_PROMPT:]
+def _save_lessons(lessons: list) -> None:
+    LESSONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LESSONS_PATH, "w", encoding="utf-8") as f:
+        for lesson in lessons:
+            f.write(json.dumps(lesson, ensure_ascii=False) + "\n")
+
+
+def _backfill_embeddings(lessons: list, base_url: str, embed_model: str) -> bool:
+    """Mutates lessons in place, embedding any entry that doesn't have one
+    yet (e.g. taught before an embedding model was available, or before this
+    feature existed). Returns True if anything changed."""
+    changed = False
+    for lesson in lessons:
+        if not lesson.get("embedding"):
+            vec = _embed(base_url, embed_model, lesson["issue"])
+            if vec:
+                lesson["embedding"] = vec
+                changed = True
+    return changed
+
+
+def _select_lessons(
+    prompt: str, category: str, base_url: str, embed_model: str,
+    top_k: int, min_similarity: float,
+) -> list:
+    all_lessons = _load_lessons()
+    if embed_model and _backfill_embeddings(all_lessons, base_url, embed_model):
+        _save_lessons(all_lessons)
+
+    candidates = all_lessons
+    if category:
+        candidates = [l for l in candidates if l.get("category") in (category, "general")]
+    if not candidates:
+        return []
+
+    if not embed_model:
+        return candidates[-top_k:]
+
+    query_vec = _embed(base_url, embed_model, prompt)
+    if not query_vec:
+        return candidates[-top_k:]  # embedding call failed -- degrade to recency
+
+    scored = []
+    for lesson in candidates:
+        vec = lesson.get("embedding")
+        if not vec:
+            continue
+        sim = _cosine(query_vec, vec)
+        if sim >= min_similarity:
+            scored.append((sim, lesson))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [lesson for _, lesson in scored[:top_k]]
+
+
+def _format_lessons_block(lessons: list) -> str:
     if not lessons:
         return ""
     lines = ["Corrections from past mistakes -- do not repeat these:"]
@@ -239,15 +376,46 @@ def cmd_run(args) -> None:
 
     try:
         _ensure_server(args.base_url)
+    except (ConnectionError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load the (small) embedding model BEFORE the main model, not after.
+    # Loading a second model can cause LM Studio to rebalance GPU memory and
+    # partially evict a model that's already resident -- observed: a fully
+    # GPU-offloaded 21GB LLM got silently pushed partway onto CPU when the
+    # embedding model loaded afterward, dropping generation from ~1.5s to
+    # 90+s. Loading the tiny embedding model first means the LLM's own
+    # --gpu max load (in _ensure_model below) happens last and claims
+    # correct offload with the embedding model's footprint already
+    # accounted for. This does not protect against an LLM that was already
+    # loaded by something else before this run -- if generation seems slow,
+    # reload it manually: lms unload --all && lms load <model> --gpu max
+    embed_model = ""
+    if not args.no_lessons:
+        try:
+            embed_model = _ensure_embedding_model(args.embed_model, args.ttl)
+        except Exception:
+            pass  # semantic retrieval is best-effort -- falls back to recency below
+        if not embed_model:
+            print("note: no embedding model available -- lesson matching falls back "
+                  "to most-recent-in-category instead of semantic similarity", file=sys.stderr)
+
+    try:
         model = _ensure_model(args.model, args.ttl)
-    except (ConnectionError, RuntimeError, FileNotFoundError) as exc:
+    except (RuntimeError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     system = args.system or ""
-    lessons = _lessons_block(args.category)
-    if lessons:
-        system = (system + "\n\n" + lessons).strip()
+    if not args.no_lessons:
+        lessons = _select_lessons(
+            prompt, args.category, args.base_url, embed_model,
+            args.top_lessons, args.min_similarity,
+        )
+        lessons_text = _format_lessons_block(lessons)
+        if lessons_text:
+            system = (system + "\n\n" + lessons_text).strip()
 
     messages = []
     if system:
@@ -262,20 +430,34 @@ def cmd_run(args) -> None:
 
 
 def cmd_teach(args) -> None:
-    LESSONS_PATH.parent.mkdir(parents=True, exist_ok=True)
     entry = {"category": args.category, "issue": args.issue, "fix": args.fix}
+    try:
+        _ensure_server(args.base_url, startup_timeout=15.0)
+        embed_model = _ensure_embedding_model(args.embed_model, args.ttl)
+        if embed_model:
+            vec = _embed(args.base_url, embed_model, args.issue)
+            if vec:
+                entry["embedding"] = vec
+    except Exception:
+        pass  # best-effort -- lesson is still recorded; embeds lazily on next `run`
+
+    LESSONS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(LESSONS_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"Recorded lesson under category={args.category!r} ({LESSONS_PATH})")
+    status = "embedded" if "embedding" in entry else "not embedded yet -- will backfill on next `run`"
+    print(f"Recorded lesson under category={args.category!r} ({status}) -> {LESSONS_PATH}")
 
 
 def cmd_lessons(args) -> None:
-    lessons = _load_lessons(args.category)
+    lessons = _load_lessons()
+    if args.category:
+        lessons = [l for l in lessons if l.get("category") in (args.category, "general")]
     if not lessons:
         print("No lessons recorded yet.")
         return
     for i, lesson in enumerate(lessons, 1):
-        print(f"{i}. [{lesson.get('category', 'general')}] {lesson['issue']}\n   -> {lesson['fix']}")
+        embedded = "embedded" if lesson.get("embedding") else "not embedded"
+        print(f"{i}. [{lesson.get('category', 'general')}, {embedded}] {lesson['issue']}\n   -> {lesson['fix']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -288,9 +470,20 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("prompt", nargs="?", help="Prompt text (omit to read from --file or stdin)")
     r.add_argument("--file", help="Read prompt text from this file instead of the positional arg")
     r.add_argument("--system", default=None, help="System prompt")
-    r.add_argument("--category", default=None, help="Lesson category to apply (default: all recorded lessons)")
+    r.add_argument("--category", default=None,
+                    help="Restrict lesson candidates to this category (plus 'general') before ranking "
+                         "by similarity. Omit to search all lessons regardless of category.")
     r.add_argument("--model", default="", help="Model id (default: whatever's loaded, else LOYAL_WINGMAN_MODEL, "
                                                 "else the sole downloaded model if unambiguous)")
+    r.add_argument("--embed-model", default="", dest="embed_model",
+                    help="Embedding model id for lesson retrieval (default: whatever's loaded, else "
+                         "LOYAL_WINGMAN_EMBED_MODEL, else the sole downloaded embedding model if unambiguous)")
+    r.add_argument("--top-lessons", type=int, default=DEFAULT_TOP_LESSONS, dest="top_lessons",
+                    help=f"Max lessons to include, most-similar first (default: {DEFAULT_TOP_LESSONS})")
+    r.add_argument("--min-similarity", type=float, default=DEFAULT_MIN_SIMILARITY, dest="min_similarity",
+                    help=f"Cosine similarity floor for a lesson to be included (default: {DEFAULT_MIN_SIMILARITY})")
+    r.add_argument("--no-lessons", action="store_true", dest="no_lessons",
+                    help="Skip lesson retrieval entirely (faster; no embedding model needed)")
     r.add_argument("--base-url", default="http://localhost:1234/v1", dest="base_url")
     r.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS,
                     help="Idle seconds before LM Studio auto-unloads the model if it had to be loaded (default: 1800)")
@@ -305,6 +498,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--category", default="general", help="Tag grouping related lessons (default: general)")
     t.add_argument("--issue", required=True, help="What the model got wrong")
     t.add_argument("--fix", required=True, help="What it should have done instead")
+    t.add_argument("--embed-model", default="", dest="embed_model", help="Embedding model id (see `run --help`)")
+    t.add_argument("--base-url", default="http://localhost:1234/v1", dest="base_url")
+    t.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
     t.set_defaults(func=cmd_teach)
 
     l = sub.add_parser("lessons", help="List recorded lessons")
