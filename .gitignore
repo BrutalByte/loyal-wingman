@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local runtime state (lessons store default location)
+.loyal-wingman/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
