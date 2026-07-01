@@ -148,8 +148,16 @@ def _ensure_model(model: str, ttl: int, load_timeout: float = 180.0) -> str:
                 )
 
     print(f"Loading {target} into LM Studio (can take up to a minute)...", file=sys.stderr)
+    # --gpu max forces full GPU offload. Without it, LM Studio's automatic
+    # offload heuristic can under-offload a model (observed: a 21GB model on
+    # a 32GB GPU left partially on CPU, dropping generation from ~1.5s to
+    # 45+s for a trivial prompt -- reported 100% GPU "utilization" the whole
+    # time, but at a fraction of the card's actual power draw, since most of
+    # the work was happening off-GPU). This only affects models THIS call
+    # loads; a model left loaded by something else (or a prior loyal-wingman
+    # run before this fix) is trusted as-is and not reloaded.
     proc = subprocess.run(
-        [_lms_bin(), "load", target, "--ttl", str(ttl)],
+        [_lms_bin(), "load", target, "--gpu", "max", "--ttl", str(ttl)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=load_timeout,
     )
     if proc.returncode != 0:
