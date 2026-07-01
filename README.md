@@ -1,5 +1,7 @@
 # Loyal Wingman
 
+[![Tests](https://github.com/BrutalByte/loyal-wingman/actions/workflows/tests.yml/badge.svg)](https://github.com/BrutalByte/loyal-wingman/actions/workflows/tests.yml)
+
 Offload menial coding-agent tasks to a local LLM (via [LM Studio](https://lmstudio.ai)),
 and teach it not to repeat mistakes.
 
